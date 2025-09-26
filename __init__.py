@@ -1,14 +1,13 @@
-# On importe le nom correct de la classe : "VideoCompressorUnified"
-from .compress_video_node import VideoCompressorUnified
+# Fichier : __init__.py
+
+from .compress_video_node import VideoCompressor
 
 NODE_CLASS_MAPPINGS = {
-    # On utilise le même nom ici
-    "VideoCompressorUnified": VideoCompressorUnified
+    "VideoCompressor": VideoCompressor
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    # Et ici, pour le nom affiché dans le menu
-    "VideoCompressorUnified": "🎬 Compress Video (Unified)"
+    "VideoCompressor": "🎬 Compress Video"
 }
 
-print("✅ ComfyUI-VideoCompressor: Node unifié chargé.")
+print("✅ ComfyUI-VideoCompressor: Node chargé avec succès.")
