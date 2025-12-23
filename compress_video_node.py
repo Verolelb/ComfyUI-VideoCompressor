@@ -7,7 +7,6 @@ from PIL import Image
 import shutil
 import datetime
 import platform
-# NOUVEL IMPORT OBLIGATOIRE
 from scipy.io.wavfile import write as write_wav
 
 class VideoCompressor:
@@ -15,21 +14,29 @@ class VideoCompressor:
     def INPUT_TYPES(s):
         return {
             "required": {
+                # --- ENTRÉES DOT ---
                 "images": ("IMAGE",),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.01}),
-                "mode": (["2pass", "fast_crf", "gpu"], {"default": "2pass"}),
-                "target_mb": ("FLOAT", {"min": 0.5, "max": 4000.0, "step": 0.5, "default": 8.0}),
+                
+                # --- PARAMÈTRES (WIDGETS) ---
+                # Si target_mb = 0, on utilise le CRF. Sinon, on vise la taille en Mo.
+                "target_mb": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10000.0, "step": 0.5, "display": "number"}),
+                
+                # Qualité (si target_mb est à 0)
+                "crf": ("INT", {"default": 23, "min": 0, "max": 51, "step": 1}),
+                
+                # Codec : Liste explicite de chaînes de caractères pour éviter l'index "1"
                 "codec": (["libx264", "libx265", "h264_nvenc", "hevc_nvenc"], {"default": "libx264"}),
+                
+                "preset": (["ultrafast","superfast","veryfast","faster","fast","medium","slow","slower","veryslow"], {"default": "fast"}),
             },
             "optional": {
-                "audio": ("*",),
-                "crf": ("INT", {"default": 23, "min": 10, "max": 40}),
-                "preset": (["ultrafast","superfast","veryfast","faster","fast","medium","slow","slower","veryslow"], {"default": "fast"}),
+                "audio": ("AUDIO",),
             }
         }
 
-    RETURN_TYPES = ("STRING", "IMAGE", "*")
-    RETURN_NAMES = ("video_path", "images", "audio")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "STRING")
+    RETURN_NAMES = ("images", "audio", "fps", "video_path")
     FUNCTION = "process"
     CATEGORY = "🎥Video Utils"
 
@@ -40,12 +47,22 @@ class VideoCompressor:
             print(f"--- ERREUR FFmpeg ---\nCommande: {' '.join(e.cmd)}\nErreur: {e.stderr}\n--- FIN ERREUR ---")
             raise e
 
-    def process(self, images, fps, mode, target_mb, codec, audio=None, crf=23, preset="fast"):
-        gpu_codecs = ["h264_nvenc", "hevc_nvenc"]
-        if mode == "gpu" and codec not in gpu_codecs: codec = "h264_nvenc"
-        elif mode in ["fast_crf", "2pass"] and codec in gpu_codecs: codec = "libx264"
+    def process(self, images, fps, target_mb, codec, crf=23, preset="fast", audio=None):
+        # --- 1. DÉTECTION DU MODE ---
+        # Si target_mb > 0, on passe en mode "Taille Cible" (2-pass), sinon mode "Qualité" (CRF)
+        if target_mb > 0.0:
+            mode = "target_size"
+            print(f"🔧 Mode détecté : Taille cible de {target_mb} MB (2-Pass)")
+        else:
+            mode = "crf"
+            print(f"🔧 Mode détecté : Qualité constante (CRF {crf}) - Taille cible ignorée (0)")
 
-        temp_dir = os.path.join(folder_paths.get_temp_directory(), "compressor_final")
+        # Gestion GPU/CPU
+        gpu_codecs = ["h264_nvenc", "hevc_nvenc"]
+        is_gpu = codec in gpu_codecs
+
+        # --- 2. PRÉPARATION DOSSIERS ---
+        temp_dir = os.path.join(folder_paths.get_temp_directory(), "comfy_compressor_v2")
         shutil.rmtree(temp_dir, ignore_errors=True)
         os.makedirs(temp_dir, exist_ok=True)
         
@@ -53,82 +70,104 @@ class VideoCompressor:
         clean_video_path = os.path.join(temp_dir, "clean_video.mp4")
         pass_log_file = os.path.join(temp_dir, "ffmpeg_passlog")
         
-        # --- LOGIQUE AUDIO FINALE ET ROBUSTE ---
+        # --- 3. GESTION AUDIO (Identique, robuste) ---
         audio_file_path = None
         has_audio = False
 
         if audio is not None:
-            # CAS 1: L'entrée est des données audio brutes (un dictionnaire)
             if isinstance(audio, dict) and 'waveform' in audio and 'sample_rate' in audio:
-                print("Détection de données audio brutes. Sauvegarde en fichier temporaire...")
-                waveform = audio['waveform'].cpu().numpy()
+                waveform = audio['waveform']
                 sample_rate = audio['sample_rate']
-                
-                # S'assurer que la forme est [samples, channels]
+                if torch.is_tensor(waveform): waveform = waveform.cpu().numpy()
                 if waveform.ndim == 3: waveform = waveform.squeeze(0)
                 if waveform.shape[0] < waveform.shape[1]: waveform = waveform.T
-
-                # Convertir de float [-1, 1] à int16 pour le fichier .wav
                 waveform_int16 = (waveform * 32767).astype(np.int16)
-                
                 temp_wav_path = os.path.join(temp_dir, "temp_audio.wav")
                 write_wav(temp_wav_path, sample_rate, waveform_int16)
                 audio_file_path = temp_wav_path
                 has_audio = True
-
-            # CAS 2: L'entrée est un chemin de fichier (string, list, ou tuple)
             else:
-                path_candidate = ""
-                if isinstance(audio, (list, tuple)) and len(audio) > 0:
-                    path_candidate = str(audio[0])
-                elif isinstance(audio, str):
-                    path_candidate = audio
-
+                path_candidate = str(audio[0]) if isinstance(audio, (list, tuple)) and len(audio) > 0 else str(audio)
                 if os.path.exists(path_candidate):
                     audio_file_path = path_candidate
                     has_audio = True
-                else:
-                    print(f"Avertissement: L'entrée audio fournie '{audio}' n'est ni des données brutes, ni un chemin valide.")
 
         try:
+            # --- 4. SAUVEGARDE IMAGES ---
+            print(f"💾 Écriture des {len(images)} frames...")
             for i, img in enumerate(images):
                 Image.fromarray((255. * img.cpu().numpy()).astype(np.uint8)).save(frames_path % i)
             
-            self._run_ffmpeg(["ffmpeg", "-y", "-framerate", str(fps), "-i", frames_path, "-c:v", "libx264", "-pix_fmt", "yuv420p", clean_video_path])
+            # --- 5. CRÉATION VIDÉO SOURCE ---
+            self._run_ffmpeg([
+                "ffmpeg", "-y", "-framerate", str(fps), "-i", frames_path, 
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", clean_video_path
+            ])
+            
             duration_s = len(images) / float(fps)
+            if duration_s <= 0.001: duration_s = 1.0 # Sécurité division par zéro
 
+            # --- 6. CALCUL BITRATE ET PARAMÈTRES ---
             output_dir = os.path.join(folder_paths.get_output_directory(), "compressed_videos")
             os.makedirs(output_dir, exist_ok=True)
             timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-            final_video_path = os.path.join(output_dir, f"compressed_{timestamp}.mp4")
+            final_video_path = os.path.join(output_dir, f"render_{timestamp}.mp4")
 
-            if duration_s <= 0: raise ValueError("Durée invalide.")
-            
-            # ... Le reste du code utilise 'audio_file_path' qui est maintenant GARANTI d'être un chemin valide ...
-            
-            if mode == "2pass":
-                audio_bitrate_bits = 128000 if has_audio else 0
-                video_bitrate_k = int(((target_mb * 1024 * 1024 * 8 / duration_s) - audio_bitrate_bits) / 1000)
-                if video_bitrate_k < 100: video_bitrate_k = 100
+            if mode == "target_size":
+                # Calcul Bitrate : (Taille_MB * 8192) / durée
+                # On soustrait l'audio (approx 128k)
+                audio_bitrate_kbps = 128 if has_audio else 0
+                total_bitrate_kbps = (target_mb * 8192) / duration_s
+                video_bitrate_k = int(total_bitrate_kbps - audio_bitrate_kbps)
+                
+                if video_bitrate_k < 50: 
+                    print("⚠️ Bitrate calculé trop bas, forcé à 100k.")
+                    video_bitrate_k = 100
 
-                pass1_cmd = ["ffmpeg", "-y", "-i", clean_video_path, "-c:v", codec, "-b:v", f"{video_bitrate_k}k", "-preset", preset, "-pass", "1", "-an", "-f", "mp4", "-passlogfile", pass_log_file, "NUL" if platform.system() == "Windows" else "/dev/null"]
-                self._run_ffmpeg(pass1_cmd)
+                # --- ENCODAGE 2 PASSES (Target Size) ---
+                print(f"⚙️ Compression 2-Passes -> Cible: {target_mb}MB (Bitrate: {video_bitrate_k}k)")
+                
+                # Pass 1
+                pass1 = [
+                    "ffmpeg", "-y", "-i", clean_video_path, "-c:v", codec, 
+                    "-b:v", f"{video_bitrate_k}k", "-preset", preset, 
+                    "-pass", "1", "-an", "-f", "mp4", 
+                    "-passlogfile", pass_log_file, 
+                    "NUL" if platform.system() == "Windows" else "/dev/null"
+                ]
+                self._run_ffmpeg(pass1)
 
-                pass2_cmd = ["ffmpeg", "-y", "-i", clean_video_path]
-                if has_audio: pass2_cmd.extend(["-i", audio_file_path])
-                pass2_cmd.extend(["-c:v", codec, "-b:v", f"{video_bitrate_k}k", "-preset", preset, "-pass", "2", "-passlogfile", pass_log_file])
-                if has_audio: pass2_cmd.extend(["-c:a", "aac", "-b:a", "128k", "-map", "0:v:0", "-map", "1:a:0"])
-                pass2_cmd.append(final_video_path)
-                self._run_ffmpeg(pass2_cmd)
+                # Pass 2
+                pass2 = ["ffmpeg", "-y", "-i", clean_video_path]
+                if has_audio: pass2.extend(["-i", audio_file_path])
+                pass2.extend([
+                    "-c:v", codec, "-b:v", f"{video_bitrate_k}k", 
+                    "-preset", preset, "-pass", "2", "-passlogfile", pass_log_file
+                ])
+                if has_audio: pass2.extend(["-c:a", "aac", "-b:a", "128k", "-map", "0:v:0", "-map", "1:a:0"])
+                pass2.append(final_video_path)
+                self._run_ffmpeg(pass2)
+
             else:
-                final_cmd = ["ffmpeg", "-y", "-i", clean_video_path]
-                if has_audio: final_cmd.extend(["-i", audio_file_path])
-                quality_param = ["-crf", str(crf)] if mode == "fast_crf" else ["-cq", str(crf)]
-                final_cmd.extend(["-c:v", codec, "-preset", preset] + quality_param)
-                if has_audio: final_cmd.extend(["-c:a", "aac", "-b:a", "128k", "-map", "0:v:0", "-map", "1:a:0"])
-                final_cmd.append(final_video_path)
-                self._run_ffmpeg(final_cmd)
+                # --- ENCODAGE CRF/CQ (Qualité) ---
+                print(f"⚙️ Compression Qualité -> CRF: {crf}")
+                cmd = ["ffmpeg", "-y", "-i", clean_video_path]
+                if has_audio: cmd.extend(["-i", audio_file_path])
+                
+                # NVENC utilise -cq au lieu de -crf, et nécessite souvent -b:v 0 pour ignorer le bitrate
+                if is_gpu:
+                    quality_args = ["-cq", str(crf), "-b:v", "0"]
+                else:
+                    quality_args = ["-crf", str(crf)]
+
+                cmd.extend(["-c:v", codec, "-preset", preset] + quality_args)
+                
+                if has_audio: cmd.extend(["-c:a", "aac", "-b:a", "128k", "-map", "0:v:0", "-map", "1:a:0"])
+                cmd.append(final_video_path)
+                self._run_ffmpeg(cmd)
             
-            return (final_video_path, images, audio if has_audio else "")
+            return (images, audio, fps, final_video_path)
+
         finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
